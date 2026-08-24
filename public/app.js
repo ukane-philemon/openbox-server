@@ -99,6 +99,9 @@
   let _readySubmitted = false;
   let _readyDeadline = 0;
   let _readyTicker = null;
+  let _sendQueue = [];
+  let _stopReadyRetry = null;
+  let _stopSwapRetry = null;
   let _socketReconnect = true;
   let _ws = null;
   let _reconnectTimer = null;
@@ -143,6 +146,7 @@
       _ws = new WebSocket(wsUrl);
       _ws.addEventListener('open', () => {
         this.send('hello', { sessionId, playerId, playerName });
+        this._flushQueue();
         startClockSync();
       });
       _ws.addEventListener('message', (event) => {
@@ -164,8 +168,49 @@
       });
     },
     send(type, payload = {}) {
-      if (!_ws || _ws.readyState !== WebSocket.OPEN) return;
-      _ws.send(JSON.stringify({ type, ...payload }));
+      const message = { type, ...payload };
+      // If the socket isn't OPEN right now (still connecting, or dropped and
+      // waiting to reconnect), queue it instead of silently dropping it.
+      // Flushed as soon as the socket (re)opens.
+      if (_ws && _ws.readyState === WebSocket.OPEN) {
+        _ws.send(JSON.stringify(message));
+      } else {
+        _sendQueue.push(message);
+      }
+    },
+    // Resends `type`/`payload` on an interval until the caller invokes the
+    // returned cancel(), or maxAttempts is hit. Only use this for actions
+    // the server treats idempotently (a repeated message is a safe no-op) --
+    // it guards against a message that reached the socket layer
+    // (readyState === OPEN) but never actually reached the server, e.g. a
+    // connection that silently died without the browser noticing yet.
+    sendReliably(type, payload = {}, { intervalMs = 3000, maxAttempts = 8 } = {}) {
+      let attempts = 0;
+      const fire = () => {
+        attempts += 1;
+        this.send(type, payload);
+      };
+      fire();
+      const id = every(() => {
+        if (attempts >= maxAttempts) {
+          clearInterval(id);
+          return;
+        }
+        fire();
+      }, intervalMs);
+      return () => clearInterval(id);
+    },
+    _flushQueue() {
+      if (!_sendQueue.length) return;
+      const pending = _sendQueue;
+      _sendQueue = [];
+      pending.forEach((message) => {
+        if (_ws && _ws.readyState === WebSocket.OPEN) {
+          _ws.send(JSON.stringify(message));
+        } else {
+          _sendQueue.push(message); // still not open -- keep it queued
+        }
+      });
     },
     handleMessage(message) {
       switch (message.type) {
@@ -480,6 +525,10 @@
     _hasEnteredSession = false;
     _readySubmitted = false;
     _readyDeadline = 0;
+    if (_stopReadyRetry) {
+      _stopReadyRetry();
+      _stopReadyRetry = null;
+    }
     _joinIntentState = 'idle';
     _roundSettled = false;
     _sessionEndedReason = '';
@@ -724,6 +773,10 @@
     swapWindowTotal = Math.max(1, Number(SESSION.swapWindowSeconds) || 10);
     swapSecs = swapWindowTotal;
     swapPhase = 'idle';
+    if (_stopSwapRetry) {
+      _stopSwapRetry();
+      _stopSwapRetry = null;
+    }
   }
 
   function getCurrentSwapRemainingMs() {
@@ -1031,6 +1084,14 @@
   function onKeepClick() {
     if (swapPhase !== 'choice') return;
     swapPhase = 'locked';
+    // Not wrapped in sendReliably(): handleKeepBox() is idempotent, but the
+    // server never broadcasts a per-player ack for a successful keep (only
+    // pending/none-state players get a message at softlock/window-close), so
+    // there is no confirmation event to stop retries on. It doesn't need
+    // one -- closeSwapWindow()/applySwapSoftLock() auto-keep any player who
+    // never sent this, so a dropped keep_box still resolves to the same
+    // outcome the player asked for. bus.send()'s queue (see above) already
+    // covers the case where the socket just isn't OPEN yet.
     bus.send('keep_box');
     resetBoxClasses();
     els.playerBox.classList.add('lock-in');
@@ -1056,10 +1117,18 @@
     setStatus('Swap Request Sent', 'Searching for a player<br>willing to swap\u2026', G_BLUE);
     setActionState('swap-waiting');
     setNote('Request active until timer ends');
-    bus.send('swap_request', { remainingMs: getCurrentSwapRemainingMs() });
+    // swap_request is idempotent server-side (requestSwap() guards on
+    // player.swapState !== NONE), so keep resending until the server's
+    // swap_result/softlock broadcast confirms it was received -- guards
+    // against a zombie socket that still reports readyState OPEN.
+    _stopSwapRetry = bus.sendReliably('swap_request', { remainingMs: getCurrentSwapRemainingMs() });
   }
 
   function onServerSwapResult(data) {
+    if (_stopSwapRetry) {
+      _stopSwapRetry();
+      _stopSwapRetry = null;
+    }
     if (data.outcome === 'found') {
       animateFound(Number(data.partnerBox));
     } else {
@@ -1068,6 +1137,10 @@
   }
 
   function applySoftLockState(data = {}) {
+    if (_stopSwapRetry) {
+      _stopSwapRetry();
+      _stopSwapRetry = null;
+    }
     const priorSwapState = String(data.priorSwapState || 'NONE').toUpperCase();
     if (priorSwapState === 'PENDING') {
       if (swapPhase === 'found' || swapPhase === 'no_match') return;
@@ -1399,7 +1472,19 @@
     _readySubmitted = true;
     els.readyBtn.disabled = true;
     els.readyHint.textContent = 'Ready submitted. Waiting for the server to start.';
-    bus.send('ready_up', { playerId });
+    // ready_up is idempotent server-side (handleRoundReady() returns
+    // alreadyReady:true and skips re-applying if this player is already in
+    // readyPlayerIdsForRound), so keep resending until the ready_status
+    // broadcast confirms this player made it into that list -- guards
+    // against a zombie socket that still reports readyState OPEN.
+    _stopReadyRetry = bus.sendReliably('ready_up', { playerId });
+  });
+
+  bus.on('ready_status', (status) => {
+    if (!_stopReadyRetry) return;
+    if (!Array.isArray(status.readyPlayerIds) || !status.readyPlayerIds.includes(playerId)) return;
+    _stopReadyRetry();
+    _stopReadyRetry = null;
   });
 
   function syncMuteButton() {
